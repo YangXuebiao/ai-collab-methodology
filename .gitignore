@@ -16,3 +16,6 @@ Thumbs.db
 *.tmp
 *.bak
 *~
+
+# 备份舱库（backup-bay：只放产物，不进版本控制）
+backups/
