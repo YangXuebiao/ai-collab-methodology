@@ -7,9 +7,7 @@
 #       纯磁盘文件树拷贝，全程不调用任何版本控制命令（零耦合）。
 # 用法: project-bay-backup.sh <阶段|代码|出差> [tag] [note]
 # 排除 = 默认可再生产物 + conf exclude_extra；只背不可再生核心。
-# 契约：backup-bay@0.1 标准（本仓库人读手册见 docs/backup-bay.md）
-# 注：本文件复制自该标准的脚本模板，**仅本行按导出规范改成中性措辞**
-#     （模板原文引用的是私有上游的路径，不进公开仓）。其余逐字与模板一致。
+# 契约：_framework/standards/backup-bay/spec/（README.md §0–§4 + lifecycle.md §5–§9）· backup-bay 0.2-draft
 # 退出码：0 成功；2 用法/配置错误
 # ============================================================================
 set -euo pipefail
@@ -18,6 +16,30 @@ REALROOT=$(pwd -P)
 [ -f backup-bay.conf ] || { echo "缺少 backup-bay.conf（复制自 standards/backup-bay 模板）；abort" >&2; exit 2; }
 # shellcheck source=backup-bay.conf
 . ./backup-bay.conf
+
+# ── 轮换保留区间（契约 spec §7）：默认 [3,7] ──────────────────────────────
+# 下界 3 = 保底（丢掉一个还有两个）；上界 7 = 防舱库膨胀（实测先例：同一份快照打三次 ≈418M）。
+RETAIN_MIN="${retain_code_min:-3}"
+RETAIN_MAX="${retain_code_max:-7}"
+# ⚠️ **必须是"是纯数字"才放行**（`2026-09-29 独立审计 R1 #6`）：第一版只做 `-lt` 比较，
+#    而 `[ "abc" -lt 1 ]` 在 bash 里**不返回非零**（只往 stderr 吐一行"需要整数表达式"）
+#    ⇒ `retain_code_max=abc` 时**轮换被静默关掉**、连打 5 个舱 `_Trash` 里 0 个、**三道门禁全绿**。
+#    **fail-open 是这一族里最贵的形状** —— 配置写错必须当场停，不许猜。
+for _v in "$RETAIN_MIN" "$RETAIN_MAX" "${size_warn_ratio:-2}"; do
+  case "$_v" in
+    ''|*[!0-9]*) echo "配置非法：retain_code_min=$RETAIN_MIN retain_code_max=$RETAIN_MAX size_warn_ratio=${size_warn_ratio:-2}（须为纯数字）" >&2; exit 2 ;;
+  esac
+done
+if [ "$RETAIN_MIN" -lt 1 ] || [ "$RETAIN_MAX" -lt "$RETAIN_MIN" ]; then
+  echo "轮换区间非法：retain_code_min=$RETAIN_MIN retain_code_max=$RETAIN_MAX（须 1 ≤ min ≤ max）" >&2
+  exit 2
+fi
+# 旧键**只告警、不静默忽略**（契约 0.2 把保留数从单值 8 改成区间 3~7）——
+# 静默忽略是"零痕迹"那一族缺陷，正是本仓反复吃亏的形状。
+if [ -n "${retain_code_bays:-}" ]; then
+  echo "[WARN] conf 的 retain_code_bays 已废弃（改用 retain_code_min/retain_code_max）；本次按 [${RETAIN_MIN},${RETAIN_MAX}] 执行" >&2
+fi
+SIZE_WARN_RATIO="${size_warn_ratio:-2}"
 
 STAGE_CN="${1:?用法: project-bay-backup.sh <阶段|代码|出差> [tag] [note]}"
 TAG="${2:-}"
@@ -138,16 +160,46 @@ NOTE_SAFE="${NOTE//|/\\|}"
 NOTE_SAFE="${NOTE_SAFE//$'\n'/ }"
 printf '| %s | %s | %s | %s | %s |\n' "$(date -u +%F\ %T)" "$STAGE_CN" "$TAG" "$NOTE_SAFE" "$SHA" >> backups/INDEX.md
 
-# ── ⑨ 轮换：代码舱按 retain_code_bays prune（阶段/出差永不自动删）────
-retain="${retain_code_bays:-8}"
-mapfile -t CODE_BAYS < <(ls -1 backups/"${project}"-code-*.tar.zst 2>/dev/null | sort)
-if [ "${#CODE_BAYS[@]}" -gt "$retain" ]; then
-  overflow=$(( ${#CODE_BAYS[@]} - retain ))
-  for old in "${CODE_BAYS[@]:0:$overflow}"; do
-    echo "[INFO] 轮换删除旧代码舱: $(basename "$old")"
-    rm -f "$old" "${old%.tar.zst}.manifest.json"
-  done
+# ── ⑨ 体积判据（契约 spec §7bis）：新舱 > 上一舱 × ratio ⇒ 告警 ─────────
+# 依据：体积突增是「不可再生分级判据失准」的**可观测信号**。
+# 实测先例 fppcDockerUpdate：10M → 142M（14×），成因是一条**可再生的** stale tar（125.9M）混进来。
+# ⚠️ 「上一舱」按 **mtime** 取，不按文件名 `sort` 取 —— 同一秒内打两个不同 tag 的舱时，
+#    文件名序**不等于**时间序（`-big` / `-same` / `-small` 按名字排，`small` 反而排最后）。
+#    这个缺陷是 `bay-policy` 的**反例对照**自己抓出来的（拿同量级舱必须静默，结果它误报）。
+PREV=$(ls -1t backups/"${project}"-*.tar.zst 2>/dev/null | command grep -v "/${ID}\.tar\.zst$" | head -n 1 || true)
+if [ -n "$PREV" ] && [ -f "$PREV" ]; then
+  PREV_BYTES=$(stat -c%s "$PREV")
+  if [ "$PREV_BYTES" -gt 0 ] && [ "$BYTES" -gt $(( PREV_BYTES * SIZE_WARN_RATIO )) ]; then
+    echo "[WARN] 体积判据：本次 ${BYTES} 字节 > 上一舱 ${PREV_BYTES} 字节 × ${SIZE_WARN_RATIO}（上一舱: $(basename "$PREV")）" >&2
+    echo "[WARN]   ⇒ 「不可再生」分级判据可能失准。请人工看一次：" >&2
+    echo "[WARN]     tar -tvf <本舱> | sort -k3 -n | tail -20   # 确认没有大型可再生件混入" >&2
+    echo "[WARN]     确认是可再生件 ⇒ 加进 backup-bay.conf 的 exclude_extra（不是删舱）" >&2
+  fi
 fi
+
+# ── ⑩ 轮换：代码舱 prune 到 retain_code_max（阶段/出差永不自动删）──────
+# ⚠️ 轮转**不物理删**（`Work/CLAUDE.md §二` 删除两步）：`mv` 进 `backups/_Trash/<UTC时间戳>-rotate/`。
+#    放 `backups/` 内是**刻意的**：契约要求「自完备 / 位置不敏感」，不能依赖任何上级目录的 `_Trash`；
+#    而 `backups/` 整体被 tar 排除，旧舱不会被卷进新舱。
+# ⚠️ **按 mtime（`ls -1t`，最新在前）**，不按文件名 `sort` —— 与 ⑨ 的体积判据**同一族缺陷**
+#    （`2026-09-29 独立审计 R1 #5` 实测）：同一秒内打两个不同 tag 的舱时，**文件名序 ≠ 时间序**，
+#    于是这一版会**trash 掉更新、保留更旧**的那个。`bay-policy` 只断言**数量**不断言**保留谁**，
+#    所以这个缺陷**当时是绿的**。本版把"保留谁"也交给 mtime，并加断言。
+mapfile -t CODE_BAYS < <(ls -1t backups/"${project}"-code-*.tar.zst 2>/dev/null)
+if [ "${#CODE_BAYS[@]}" -gt "$RETAIN_MAX" ]; then
+  overflow=$(( ${#CODE_BAYS[@]} - RETAIN_MAX ))
+  ROT_TS=$(date -u +%Y%m%d-%H%M%S)
+  TRASH_DIR="backups/_Trash/${ROT_TS}-rotate"
+  mkdir -p "$TRASH_DIR"
+  for old in "${CODE_BAYS[@]:RETAIN_MAX}"; do
+    echo "[INFO] 轮换：旧代码舱移入 $TRASH_DIR（不物理删）: $(basename "$old")"
+    mv -f "$old" "$TRASH_DIR/"
+    [ -f "${old%.tar.zst}.manifest.json" ] && mv -f "${old%.tar.zst}.manifest.json" "$TRASH_DIR/"
+  done
+  echo "[INFO] 轮换 ${overflow} 个 → $TRASH_DIR（90 天后本人清空；见 Work/CLAUDE.md §二 删除两步）"
+fi
+KEPT=$(ls -1 backups/"${project}"-code-*.tar.zst 2>/dev/null | wc -l)
+[ "$KEPT" -lt "$RETAIN_MIN" ] && echo "[WARN] 代码舱只剩 ${KEPT} 个 < 下界 ${RETAIN_MIN}（保底被击穿，查 retain_code_max 设置）" >&2
 
 echo "舱已生成: backups/$ID.tar.zst"
 echo "manifest: backups/$ID.manifest.json"
