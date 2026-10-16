@@ -19,3 +19,7 @@ Thumbs.db
 
 # 备份舱库（backup-bay：只放产物，不进版本控制）
 backups/
+
+# Python 离线测试缓存（非交付证据）
+__pycache__/
+*.pyc
