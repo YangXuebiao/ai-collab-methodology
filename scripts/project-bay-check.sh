@@ -3,7 +3,7 @@
 # Project Bay Check — 备份舱体检（舱状态）
 # ============================================================================
 # 用途：报告舱库最新状态 —— 最新舱时间 / stage / tag / 距上次多久 /
-#       归档 sha256 重算比对 / 可否解包 / 代码舱保留计数与 _Trash 待清空量。
+#       归档 sha256 重算比对 / 可否解包 / 代码舱保留计数与隔离区待清空量。
 #       超过 stale_hours 时提示「建议阶段备份」，但**本脚本只报不打** ——
 #       打舱由 AI 按契约 §5 触发轴（版本 bump）执行，不在这里自动触发。
 # 用法: project-bay-check.sh
@@ -76,13 +76,16 @@ else
 fi
 
 # 轮换健康（契约 §7 / §7bis）：代码舱计数须落在 [min,max]；_Trash 里的量要有人收
-CODE_N=$(ls -1 backups/*-code-*.tar.zst 2>/dev/null | wc -l)
+# ⚠️ 用 `find` 不用 `ls | wc -l` —— 后者在无匹配时 `ls` 退出 2，`set -euo pipefail` 下会**静默终止整脚本**
+#    （同 `project-bay-backup.sh` 里那处，2026-09-29 一并修）。
+CODE_N=$(find backups -maxdepth 1 -name '*-code-*.tar.zst' 2>/dev/null | wc -l || true)
 RMIN="${retain_code_min:-3}"
 RMAX="${retain_code_max:-7}"
 echo "代码舱:      ${CODE_N} 个（契约区间 [${RMIN},${RMAX}]）$([ "$CODE_N" -gt "$RMAX" ] && echo '  ⚠️ 超出上界（下次打舱会轮换）')"
-if [ -d backups/_Trash ]; then
-  TRASH_N=$(find backups/_Trash -name '*.tar.zst' 2>/dev/null | wc -l)
-  [ "$TRASH_N" -gt 0 ] && echo "_Trash:      ${TRASH_N} 个旧舱待清空（删除两步第二步，本人执行）"
+TRASH_DIR="${quarantine_dir:-backups/_Trash}"
+if [ -d "$TRASH_DIR" ]; then
+  TRASH_N=$(find "$TRASH_DIR" -name '*.tar.zst' 2>/dev/null | wc -l)
+  [ "$TRASH_N" -gt 0 ] && echo "隔离区:      ${TRASH_N} 个旧舱待清空（${TRASH_DIR}；删除两步第二步，本人执行）"
 fi
 
 echo "──────────────────────────────────────────────"

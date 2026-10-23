@@ -178,9 +178,12 @@ if [ -n "$PREV" ] && [ -f "$PREV" ]; then
 fi
 
 # ── ⑩ 轮换：代码舱 prune 到 retain_code_max（阶段/出差永不自动删）──────
-# ⚠️ 轮转**不物理删**（`Work/CLAUDE.md §二` 删除两步）：`mv` 进 `backups/_Trash/<UTC时间戳>-rotate/`。
-#    放 `backups/` 内是**刻意的**：契约要求「自完备 / 位置不敏感」，不能依赖任何上级目录的 `_Trash`；
-#    而 `backups/` 整体被 tar 排除，旧舱不会被卷进新舱。
+# ⚠️ 轮转**不物理删**（`Work/CLAUDE.md §二` 删除两步）：`mv` 进 `<quarantine_dir>/<UTC时间戳>-rotate/`。
+#    默认 `quarantine_dir=backups/_Trash`：放 `backups/` 内是**刻意的** —— 契约要求「自完备 /
+#    位置不敏感」，不能依赖任何上级目录的 `_Trash`；而 `backups/` 整体被 tar 排除，旧舱不会被卷进新舱。
+#    **可选覆盖**：conf 写 `quarantine_dir="<相对或绝对路径>"` 可把隔离区指到别处；
+#    本机 Work 树（2026-10-24 起）把各实现指到 **Work 外** `_Trash-outside/backup-bay-rotate`，
+#    以免在树内累积 `_Trash`。默认行为不变 ⇒ 非本机副本仍可自包含。
 # ⚠️ **按 mtime（`ls -1t`，最新在前）**，不按文件名 `sort` —— 与 ⑨ 的体积判据**同一族缺陷**
 #    （`2026-09-29 独立审计 R1 #5` 实测）：同一秒内打两个不同 tag 的舱时，**文件名序 ≠ 时间序**，
 #    于是这一版会**trash 掉更新、保留更旧**的那个。`bay-policy` 只断言**数量**不断言**保留谁**，
@@ -189,7 +192,7 @@ mapfile -t CODE_BAYS < <(ls -1t backups/"${project}"-code-*.tar.zst 2>/dev/null)
 if [ "${#CODE_BAYS[@]}" -gt "$RETAIN_MAX" ]; then
   overflow=$(( ${#CODE_BAYS[@]} - RETAIN_MAX ))
   ROT_TS=$(date -u +%Y%m%d-%H%M%S)
-  TRASH_DIR="backups/_Trash/${ROT_TS}-rotate"
+  TRASH_DIR="${quarantine_dir:-backups/_Trash}/${ROT_TS}-rotate"
   mkdir -p "$TRASH_DIR"
   for old in "${CODE_BAYS[@]:RETAIN_MAX}"; do
     echo "[INFO] 轮换：旧代码舱移入 $TRASH_DIR（不物理删）: $(basename "$old")"
@@ -198,8 +201,22 @@ if [ "${#CODE_BAYS[@]}" -gt "$RETAIN_MAX" ]; then
   done
   echo "[INFO] 轮换 ${overflow} 个 → $TRASH_DIR（90 天后本人清空；见 Work/CLAUDE.md §二 删除两步）"
 fi
-KEPT=$(ls -1 backups/"${project}"-code-*.tar.zst 2>/dev/null | wc -l)
-[ "$KEPT" -lt "$RETAIN_MIN" ] && echo "[WARN] 代码舱只剩 ${KEPT} 个 < 下界 ${RETAIN_MIN}（保底被击穿，查 retain_code_max 设置）" >&2
+# 🔴 **不许写成 `KEPT=$(ls … | wc -l)`** —— 本脚本 `set -euo pipefail`，而 `ls` 在**无匹配**时退出 2
+#    （glob 不展开 ⇒ ENOENT）⇒ 经 `pipefail` 变成整条管道的 rc ⇒ **赋值语句触发 `set -e` ⇒ 脚本当场退出 2**。
+#    实测后果（2026-09-29，由 box-out 的真实调用暴露）：**凡是没打过「代码」舱的项目，打任何「阶段/出差」舱
+#    都会在末尾静默退出 2** —— 而舱其实**已经打好了**（manifest/INDEX 都写了）。
+#    ⚠️ **`bay-policy` 当时 19/19 全绿也没抓到**：它的 fixture 全都先打过代码舱，`ls` 有匹配 ⇒ 永远不触发。
+#    ⚠️ 同类写法在 `project-bay-check.sh` 里也有，已一并改。**新增同类判据请用 `find`（无匹配也退出 0）。**
+KEPT=$(find backups -maxdepth 1 -name "${project}-code-*.tar.zst" 2>/dev/null | wc -l || true)
+# ⚠️ 2026-10-24 回灌（来自 converge-backend 2026-10-22 的本地修复）：
+#   `KEPT == 0` **不等于**「保底被击穿」。本项目可能历来只打**阶段舱**（按契约永不自动删），
+#   代码舱从未存在 ⇒ 旧写法每次打舱都假报「保底被击穿」，把正常状态说成故障。
+#   ⇒ 0 个 = 说明「无代码舱，下界不适用」；>0 但 < 下界 才是真的击穿。
+if [ "$KEPT" -eq 0 ]; then
+  echo "[INFO] 当前没有代码舱（只打阶段舱时属正常）—— 代码舱保留下界 ${RETAIN_MIN} 不适用" >&2
+elif [ "$KEPT" -lt "$RETAIN_MIN" ]; then
+  echo "[WARN] 代码舱只剩 ${KEPT} 个 < 下界 ${RETAIN_MIN}（保底被击穿，查 retain_code_max 设置）" >&2
+fi
 
 echo "舱已生成: backups/$ID.tar.zst"
 echo "manifest: backups/$ID.manifest.json"
